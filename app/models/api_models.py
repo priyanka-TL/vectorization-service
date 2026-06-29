@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 from typing import Optional, List, Dict, Any, Literal
 from app.config import settings
 
@@ -92,11 +92,17 @@ class PrioritizedSearchRequest(BaseModel):
     include_scoring_debug: bool = Field(
         default=settings.INCLUDE_SCORING_DEBUG,
         description="When true, each result includes the hybrid fusion breakdown "
-                    "(keyword_score, rrf_score, dense_rank, sparse_rank) for inspecting "
-                    "how the final score was produced. Defaults to the INCLUDE_SCORING_DEBUG "
-                    "env setting; a request may override it per call. Off by default to keep "
-                    "responses lean."
+                    "(keyword_text_score, keyword_title_score, dense_score, normalized_dense, "
+                    "normalized_sparse, fusion_score, rrf_score, dense_rank, sparse_rank) for "
+                    "inspecting how the final score was produced. Defaults to the "
+                    "INCLUDE_SCORING_DEBUG env setting; a request may override it per call. "
+                    "Off by default to keep responses lean."
     )
+
+_SCORING_DEBUG_FIELDS = frozenset({
+    'dense_score', 'normalized_dense', 'normalized_sparse', 'fusion_score',
+    'rrf_score', 'dense_rank', 'sparse_rank',
+})
 
 class SearchResultItem(BaseModel):
     id: str
@@ -117,10 +123,32 @@ class SearchResultItem(BaseModel):
             "for unscored fields to distinguish them from a genuine zero-score."
         )
     )
-    keyword_score: Optional[float] = Field(
+    keyword_text_score: Optional[float] = Field(
         default=None,
-        description="Raw BM25 sparse vector score (Phase 2). Populated only when the request sets "
-                    "include_scoring_debug=true; None otherwise or when sparse search is disabled."
+        description="Raw bm25_text sparse score. None if the document had no BM25 body hit "
+                    "(distinguishable from a genuine score of 0.0). Debug-only."
+    )
+    keyword_title_score: Optional[float] = Field(
+        default=None,
+        description="Raw bm25_title sparse score. None if the document had no BM25 title hit. "
+                    "Debug-only (include_scoring_debug=true)."
+    )
+    dense_score: Optional[float] = Field(
+        default=None,
+        description="Raw weighted dense sum (pre-normalization). Debug-only."
+    )
+    normalized_dense: Optional[float] = Field(
+        default=None,
+        description="min-max normalized dense score ∈ [0, 1]. Debug-only."
+    )
+    normalized_sparse: Optional[float] = Field(
+        default=None,
+        description="sparse_combined ∈ [0, 1]: weighted blend of norm_bm25_title and norm_bm25_text. "
+                    "Debug-only (include_scoring_debug=true)."
+    )
+    fusion_score: Optional[float] = Field(
+        default=None,
+        description="Final weighted_score used for ranking (explicit label). Debug-only."
     )
     rrf_score: Optional[float] = Field(
         default=None,
@@ -130,13 +158,11 @@ class SearchResultItem(BaseModel):
     )
     dense_rank: Optional[int] = Field(
         default=None,
-        description="1-indexed rank of this document in the combined dense list (ranked by the "
-                    "weighted multi-field cosine sum). Debug-only (include_scoring_debug=true)."
+        description="1-indexed rank of this document in the combined dense list. Debug-only."
     )
     sparse_rank: Optional[int] = Field(
         default=None,
-        description="1-indexed rank of this document in the BM25 sparse list, or None if it had no "
-                    "sparse hit. Debug-only (include_scoring_debug=true)."
+        description="1-indexed rank in the BM25 sparse list, or None if no sparse hit. Debug-only."
     )
     title_match: Optional[str] = Field(
         default=None,
@@ -146,6 +172,11 @@ class SearchResultItem(BaseModel):
         default=None,
         description="Summary match type: 'exact', 'partial', or None if no summary match"
     )
+
+    @model_serializer(mode='wrap')
+    def _drop_null_debug_fields(self, handler):
+        data = handler(self)
+        return {k: v for k, v in data.items() if k not in _SCORING_DEBUG_FIELDS or v is not None}
 
 class PrioritizedSearchResponse(BaseModel):
     query: Optional[str] = None

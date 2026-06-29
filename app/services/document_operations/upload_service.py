@@ -1,3 +1,4 @@
+import re
 import uuid
 import logging
 from datetime import datetime
@@ -16,6 +17,22 @@ from app.services.file_processors.text_processor import TextProcessor
 from app.services.url_text_extractor import URLTextExtractor
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_bm25_title(title: str) -> str:
+    """Normalize a document title for BM25 sparse indexing.
+
+    Strips file extensions, replaces filename separators with spaces,
+    removes remaining punctuation, collapses whitespace, and lowercases.
+    Ensures filename tokens like "source_doc_MI_Repository_c3481f.docx"
+    are indexed as individual searchable words.
+    """
+    if not title:
+        return ""
+    t = re.sub(r'\.\w{2,10}$', '', title)   # strip .docx / .pdf / .xlsx etc.
+    t = re.sub(r'[_\-./\\]+', ' ', t)        # separators → space
+    t = re.sub(r'[^\w\s]', ' ', t)           # remaining punctuation → space
+    return re.sub(r'\s+', ' ', t).strip().lower()
 
 
 class UploadService(BaseDocumentOperation):
@@ -282,13 +299,13 @@ class UploadService(BaseDocumentOperation):
         
         return chunk_metadata
 
-    def _create_point_vectors(self, text_embedding, field_embeddings: dict, sparse_vector=None):
+    def _create_point_vectors(self, text_embedding, field_embeddings: dict, sparse_vectors: dict = None):
         """Build the vectors dict for a Qdrant point.
 
         Always includes the dense "text" vector plus any available field vectors
-        (title, summary, tags, metadata). When sparse_vector is provided it is
-        stored under settings.SPARSE_VECTOR_NAME (default "bm25") to enable
-        BM25 keyword search alongside dense retrieval.
+        (title, summary, tags, metadata). When sparse_vectors is provided it must
+        be a dict mapping vector_name → SparseVector (or None); all non-None entries
+        are merged into vectors_dict.
         """
         vectors_dict = {"text": validate_vector(text_embedding)}
 
@@ -296,9 +313,10 @@ class UploadService(BaseDocumentOperation):
             if field_name in field_embeddings:
                 vectors_dict[field_name] = validate_vector(field_embeddings[field_name])
 
-        if sparse_vector is not None:
-            # sparse_vector is a qdrant_client SparseVector model instance
-            vectors_dict[settings.SPARSE_VECTOR_NAME] = sparse_vector
+        if sparse_vectors:
+            for vec_name, sv in sparse_vectors.items():
+                if sv is not None:
+                    vectors_dict[vec_name] = sv
 
         return vectors_dict
 
@@ -311,24 +329,28 @@ class UploadService(BaseDocumentOperation):
 
         field_embeddings = self._generate_field_embeddings(title, summary, tags, additional_metadata)
 
-        # Phase 2: generate BM25 sparse vectors when enabled.
-        sparse_vectors: List[object] = []
+        # Phase 2: generate dual BM25 sparse vectors (bm25_text + bm25_title) when enabled.
+        sparse_vectors_list: List[dict] = []
         if settings.SPARSE_SEARCH_ENABLED:
             try:
                 from app.core.clients.sparse_encoder import generate_sparse_vector
                 from qdrant_client.models import SparseVector  # type: ignore[import]
+                title_src = _normalize_bm25_title(title or "")
                 for chunk in processed_chunks:
-                    indices, values = generate_sparse_vector(chunk.get("text", ""))
-                    sparse_vectors.append(
-                        SparseVector(indices=indices, values=values) if indices else None
-                    )
-                logger.info(f"Sparse BM25 vectors generated for {len(sparse_vectors)} chunks")
+                    text_src = chunk.get("text", "")
+                    ti, tv = generate_sparse_vector(text_src)
+                    li, lv = generate_sparse_vector(title_src) if title_src else ([], [])
+                    sparse_vectors_list.append({
+                        settings.SPARSE_TEXT_VECTOR_NAME:  SparseVector(indices=ti, values=tv) if ti else None,
+                        settings.SPARSE_TITLE_VECTOR_NAME: SparseVector(indices=li, values=lv) if li else None,
+                    })
+                logger.info(f"Dual BM25 sparse vectors generated for {len(sparse_vectors_list)} chunks")
             except Exception as exc:
                 logger.warning(
                     f"Sparse vector generation skipped (non-fatal): {exc}. "
                     "Only dense vectors will be stored."
                 )
-                sparse_vectors = []
+                sparse_vectors_list = []
 
         points = []
         for idx, (chunk, text_embedding) in enumerate(zip(processed_chunks, text_embeddings)):
@@ -354,8 +376,8 @@ class UploadService(BaseDocumentOperation):
                 "tags": tags if tags else None
             }
 
-            sparse_vec = sparse_vectors[idx] if idx < len(sparse_vectors) else None
-            vectors_dict = self._create_point_vectors(text_embedding, field_embeddings, sparse_vec)
+            sparse_vecs = sparse_vectors_list[idx] if idx < len(sparse_vectors_list) else None
+            vectors_dict = self._create_point_vectors(text_embedding, field_embeddings, sparse_vecs)
 
             point = models.PointStruct(
                 id=chunk_id,

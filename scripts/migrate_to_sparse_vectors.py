@@ -4,19 +4,20 @@ TWO MODES depending on whether --new-collection is provided:
 
   IN-PLACE MODE (no --new-collection):
     Adds BM25 sparse vectors to points in the EXISTING collection.
-    Requires the collection to already have the 'bm25' sparse vector field declared.
+    Requires the collection to already have the sparse vector fields declared
+    (SPARSE_TEXT_VECTOR_NAME and SPARSE_TITLE_VECTOR_NAME).
     Use this if the collection was created with SPARSE_SEARCH_ENABLED=true,
-    or after manually adding the sparse field to a fresh/empty collection.
+    or after manually adding both sparse fields to a fresh/empty collection.
 
     Usage:
         PYTHONPATH=. COLLECTION_NAME=documents1 SPARSE_SEARCH_ENABLED=true \\
           .venv/bin/python3 scripts/migrate_to_sparse_vectors.py
 
   BLUE-GREEN MODE (with --new-collection):
-    Use for production collections that do NOT yet have the sparse vector field.
+    Use for production collections that do NOT yet have the sparse vector fields.
     Qdrant's vector schema is fixed at collection creation — sparse fields cannot
     be added to an existing collection. This mode works around that by:
-      1. Creating a NEW collection with the full schema (dense + BM25 sparse).
+      1. Creating a NEW collection with the full schema (dense + both BM25 sparse fields).
       2. Copying all points (dense vectors + payload) from the source collection.
       3. Generating and writing BM25 sparse vectors for every point.
       4. Verifying point count and BM25 spot-check before touching .env.
@@ -37,7 +38,8 @@ Requirements:
     - Run from the vectorization-service root (PYTHONPATH=.)
     - QDRANT_HOST / QDRANT_PORT env vars (defaults: 127.0.0.1 / 6333)
     - COLLECTION_NAME env var (default: "documents")
-    - SPARSE_VECTOR_NAME env var (default: "bm25")
+    - SPARSE_TEXT_VECTOR_NAME env var (default: "bm25_text")
+    - SPARSE_TITLE_VECTOR_NAME env var (default: "bm25_title")
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BACKGROUND — WHY THIS MIGRATION EXISTS
@@ -168,44 +170,46 @@ def _flush_update_vectors(client, collection_name: str, pending: list, dry_run: 
     return migrated, errors
 
 
-def _encode_and_queue(generate_sparse_vector, SparseVector, PointVectors,
-                      point, sparse_name: str, pending: list) -> str:
+def _encode_and_queue(generate_sparse_vector, normalize_bm25_title, SparseVector, PointVectors,
+                      point, text_vec_name: str, title_vec_name: str, pending: list) -> str:
     """
-    Generate BM25 vector for a point and append to pending list.
+    Generate BM25 vectors (text + title) for a point and append to pending list.
     Returns 'queued', 'skipped', 'no_tokens', or 'error'.
     'skipped'   — point has no text payload (nothing to encode).
     'no_tokens' — text exists but BM25 produced empty indices (e.g. pure
                   markdown table separators like |:---|:---|); no vector written.
     'error'     — encoder raised an exception.
-    'queued'    — vector generated and appended to pending batch.
+    'queued'    — at least one vector generated and appended to pending batch.
     """
-    text = (point.payload or {}).get("text", "")
+    payload  = point.payload or {}
+    text     = payload.get("text", "")
+    title    = normalize_bm25_title(payload.get("title") or "")
     if not text:
         return "skipped"
     try:
-        indices, values = generate_sparse_vector(text)
+        text_indices,  text_values  = generate_sparse_vector(text)
+        title_indices, title_values = generate_sparse_vector(title) if title else ([], [])
     except Exception as exc:
         logger.warning(f"BM25 encoding failed for point {point.id}: {exc}")
         return "error"
-    if not indices:
+    if not text_indices:
         return "no_tokens"
-    pending.append(
-        PointVectors(
-            id=point.id,
-            vector={sparse_name: SparseVector(indices=indices, values=values)},
-        )
-    )
+    vectors: dict = {text_vec_name: SparseVector(indices=text_indices, values=text_values)}
+    if title_indices:
+        vectors[title_vec_name] = SparseVector(indices=title_indices, values=title_values)
+    pending.append(PointVectors(id=point.id, vector=vectors))
     return "queued"
 
 
 # ── In-place mode ─────────────────────────────────────────────────────────────
 
-def run_inplace(client, collection_name: str, sparse_name: str, args,
-                generate_sparse_vector, SparseVector, PointVectors) -> None:
-    """Add BM25 sparse vectors to points in an existing collection (in-place)."""
-    logger.info("MODE: In-place — adding BM25 sparse vectors to existing collection.")
-    logger.info(f"  Collection : {collection_name}")
-    logger.info(f"  Sparse name: {sparse_name}")
+def run_inplace(client, collection_name: str, text_vec_name: str, title_vec_name: str, args,
+                generate_sparse_vector, normalize_bm25_title, SparseVector, PointVectors) -> None:
+    """Add dual BM25 sparse vectors (text + title) to points in an existing collection (in-place)."""
+    logger.info("MODE: In-place — adding dual BM25 sparse vectors to existing collection.")
+    logger.info(f"  Collection      : {collection_name}")
+    logger.info(f"  Text vec name   : {text_vec_name}")
+    logger.info(f"  Title vec name  : {title_vec_name}")
     if args.dry_run:
         logger.info("  DRY RUN — no changes will be written.")
 
@@ -221,8 +225,8 @@ def run_inplace(client, collection_name: str, sparse_name: str, args,
         scroll_kwargs = dict(
             collection_name=collection_name,
             limit=args.scroll_limit,
-            with_payload=["text"],
-            with_vectors=[sparse_name],
+            with_payload=["text", "title"],
+            with_vectors=[text_vec_name, title_vec_name],
         )
         if offset is not None:
             scroll_kwargs["offset"] = offset
@@ -236,15 +240,15 @@ def run_inplace(client, collection_name: str, sparse_name: str, args,
         for point in points:
             scanned += 1
 
-            # Skip points that already have the sparse vector
-            existing = (getattr(point, "vector", {}) or {}).get(sparse_name)
+            # Skip points that already have the text sparse vector (idempotent check)
+            existing = (getattr(point, "vector", {}) or {}).get(text_vec_name)
             if existing and getattr(existing, "indices", None):
                 skipped += 1
                 continue
 
             result = _encode_and_queue(
-                generate_sparse_vector, SparseVector, PointVectors,
-                point, sparse_name, pending,
+                generate_sparse_vector, normalize_bm25_title, SparseVector, PointVectors,
+                point, text_vec_name, title_vec_name, pending,
             )
             if result == "error":
                 errors += 1
@@ -285,25 +289,33 @@ def run_inplace(client, collection_name: str, sparse_name: str, args,
 
 # ── Blue-green mode ───────────────────────────────────────────────────────────
 
-def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> bool:
+def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> tuple[bool, dict]:
     """Deep verification of the blue-green migration.
 
     Checks:
       1. Point count in new collection matches old collection.
       2. BM25 missing rate across ALL points is under 10%.
 
-    Returns True if all checks pass, False otherwise.
+    Returns (passed, stats) where stats contains all counts for the final summary.
     """
     logger.info("=" * 60)
     logger.info("STEP 4: Verification")
     passed = True
+    stats: dict = {
+        "old_count": 0, "new_count": 0, "count_ok": False,
+        "bm25_ok": 0, "bm25_missing": 0, "bm25_no_text": 0,
+        "bm25_missing_rate": 0.0, "bm25_coverage_ok": False,
+    }
 
     # Check 1: Point count
     try:
         old_count = client.count(old_col).count
         new_count = client.count(new_col).count
+        stats["old_count"] = old_count
+        stats["new_count"] = new_count
         logger.info(f"  Point count — source '{old_col}': {old_count}, target '{new_col}': {new_count}")
         if new_count == old_count:
+            stats["count_ok"] = True
             logger.info(f"  ✅ Count check passed: {new_count} == {old_count}")
         else:
             logger.error(f"  ❌ Count mismatch: expected {old_count}, got {new_count}")
@@ -345,6 +357,10 @@ def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> b
 
         total_text = bm25_ok + bm25_missing
         missing_rate = bm25_missing / total_text if total_text else 0.0
+        stats["bm25_ok"] = bm25_ok
+        stats["bm25_missing"] = bm25_missing
+        stats["bm25_no_text"] = bm25_no_text
+        stats["bm25_missing_rate"] = missing_rate
         logger.info(
             f"  BM25 check ({total_text} text-bearing points): "
             f"ok={bm25_ok}, missing={bm25_missing} ({missing_rate:.1%}), no_text={bm25_no_text}"
@@ -355,12 +371,13 @@ def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> b
             )
             passed = False
         else:
+            stats["bm25_coverage_ok"] = True
             logger.info(f"  ✅ BM25 check passed (missing rate {missing_rate:.1%} ≤ 10%)")
     except Exception as exc:
         logger.error(f"  ❌ BM25 check error: {exc}")
         passed = False
 
-    return passed
+    return passed, stats
 
 
 def _update_env_file(env_path: str, old_col: str, new_col: str) -> bool:
@@ -401,15 +418,17 @@ def _update_env_file(env_path: str, old_col: str, new_col: str) -> bool:
         return False
 
 
-def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
-                  generate_sparse_vector, SparseVector, PointVectors, PointStruct,
+def run_bluegreen(client, old_col: str, new_col: str,
+                  text_vec_name: str, title_vec_name: str, args,
+                  generate_sparse_vector, normalize_bm25_title, SparseVector, PointVectors, PointStruct,
                   VectorParams, Distance, SparseVectorParams, Modifier,
                   env_path: str = ".env") -> None:
-    """Copy collection to a new name, then add BM25 sparse vectors (blue-green)."""
-    logger.info("MODE: Blue-green — migrating to a new collection with BM25 sparse vectors.")
-    logger.info(f"  Source : {old_col}")
-    logger.info(f"  Target : {new_col}")
-    logger.info(f"  Sparse : {sparse_name}")
+    """Copy collection to a new name, then add dual BM25 sparse vectors (blue-green)."""
+    logger.info("MODE: Blue-green — migrating to a new collection with dual BM25 sparse vectors.")
+    logger.info(f"  Source         : {old_col}")
+    logger.info(f"  Target         : {new_col}")
+    logger.info(f"  Text vec name  : {text_vec_name}")
+    logger.info(f"  Title vec name : {title_vec_name}")
     if args.dry_run:
         logger.info("  DRY RUN — no changes will be written.")
 
@@ -438,14 +457,19 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
             collection_name=new_col,
             vectors_config=src_vectors_config,
             sparse_vectors_config={
-                sparse_name: SparseVectorParams(modifier=Modifier.IDF)
+                text_vec_name:  SparseVectorParams(modifier=Modifier.IDF),
+                title_vec_name: SparseVectorParams(modifier=Modifier.IDF),
             },
         )
-        logger.info(f"Created '{new_col}' with dense={list(src_vectors_config)} + sparse=[{sparse_name}]")
+        logger.info(
+            f"Created '{new_col}' with dense={list(src_vectors_config)} "
+            f"+ sparse=[{text_vec_name}, {title_vec_name}]"
+        )
     else:
         logger.info(f"[DRY RUN] Would create target collection '{new_col}'")
 
     # Step 2: Copy dense vectors + payload
+    copy_count = 0
     if not args.skip_copy:
         logger.info("=" * 60)
         logger.info("STEP 2: Copying dense vectors + payload")
@@ -493,15 +517,16 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
                 break
             offset = next_offset
 
+        copy_count = copied
         logger.info(f"Copy complete: {copied} points transferred.")
     else:
         logger.info("Skipping copy step (--skip-copy).")
 
-    # Step 3: Generate and write BM25 sparse vectors
-    bm25_errors = 0
+    # Step 3: Generate and write dual BM25 sparse vectors
+    bm25_migrated = bm25_skipped = bm25_no_tokens = bm25_errors = 0
     if not args.skip_bm25:
         logger.info("=" * 60)
-        logger.info("STEP 3: Generating BM25 sparse vectors on target collection")
+        logger.info("STEP 3: Generating dual BM25 sparse vectors on target collection")
         migrated = skipped = no_tokens = errors = 0
         offset = None
         pending: list = []
@@ -511,8 +536,8 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
             scroll_kwargs = dict(
                 collection_name=new_col,
                 limit=args.scroll_limit,
-                with_payload=["text"],
-                with_vectors=[sparse_name],
+                with_payload=["text", "title"],
+                with_vectors=[text_vec_name, title_vec_name],
             )
             if offset is not None:
                 scroll_kwargs["offset"] = offset
@@ -524,15 +549,15 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
                 break
 
             for point in points:
-                # Skip already-encoded points (idempotent)
-                existing = (getattr(point, "vector", {}) or {}).get(sparse_name)
+                # Skip already-encoded points (idempotent — check text vector)
+                existing = (getattr(point, "vector", {}) or {}).get(text_vec_name)
                 if existing and getattr(existing, "indices", None):
                     skipped += 1
                     continue
 
                 result = _encode_and_queue(
-                    generate_sparse_vector, SparseVector, PointVectors,
-                    point, sparse_name, pending,
+                    generate_sparse_vector, normalize_bm25_title, SparseVector, PointVectors,
+                    point, text_vec_name, title_vec_name, pending,
                 )
                 if result == "error":
                     errors += 1
@@ -572,7 +597,7 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
                 f"  ℹ️  {no_tokens} point(s) had text but produced no BM25 tokens "
                 f"(e.g. markdown table separators). No sparse vector written — expected."
             )
-        bm25_errors = errors
+        bm25_migrated, bm25_skipped, bm25_no_tokens, bm25_errors = migrated, skipped, no_tokens, errors
         if errors:
             logger.warning("=" * 60)
             logger.warning(f"⚠️  BM25 ENCODING: {errors} point(s) failed — these points will lack sparse vectors.")
@@ -599,23 +624,69 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
         logger.info("[DRY RUN] Skipping verification and .env update.")
         return
 
-    migration_ok = _verify_migration(client, old_col, new_col, sparse_name)
+    migration_ok, verify_stats = _verify_migration(client, old_col, new_col, text_vec_name)
 
     host = os.getenv("QDRANT_HOST", "127.0.0.1")
     port = os.getenv("QDRANT_PORT", "6333")
 
+    # Auto-update .env (only on success)
+    env_updated = False
     if migration_ok:
-        logger.info("=" * 60)
-        logger.info("✅ MIGRATION SUCCESSFUL")
-        if bm25_errors:
-            logger.warning(f"  ⚠️  {bm25_errors} point(s) had BM25 encoding errors and lack sparse vectors.")
-            logger.warning("     Re-run with --skip-copy to back-fill them (idempotent).")
-        logger.info("")
-        # Auto-update .env
         logger.info(f"Updating .env file at '{env_path}'...")
         env_updated = _update_env_file(env_path, old_col, new_col)
 
-        logger.info("=" * 60)
+    # ── Final summary ──────────────────────────────────────────────────────────
+    logger.info("=" * 60)
+    if migration_ok:
+        logger.info("✅ MIGRATION SUCCESSFUL")
+    else:
+        logger.error("❌ MIGRATION FAILED VERIFICATION")
+    logger.info("=" * 60)
+    logger.info("MIGRATION SUMMARY")
+    logger.info(f"  Source : {old_col}  ({verify_stats['old_count']} points)")
+    logger.info(f"  Target : {new_col}  ({verify_stats['new_count']} points)")
+    logger.info("")
+
+    # Step 2 — Copy
+    logger.info("  STEP 2 — Copy dense vectors + payload")
+    if args.skip_copy:
+        logger.info("    Skipped (--skip-copy)")
+    else:
+        logger.info(f"    Copied           : {copy_count}")
+    logger.info("")
+
+    # Step 3 — BM25 Encoding
+    logger.info("  STEP 3 — BM25 Encoding")
+    if args.skip_bm25:
+        logger.info("    Skipped (--skip-bm25)")
+    else:
+        bm25_total = bm25_migrated + bm25_skipped + bm25_no_tokens + bm25_errors
+        logger.info(f"    Total scanned    : {bm25_total}")
+        logger.info(f"    Encoded (ok)     : {bm25_migrated}  (sparse vectors written)")
+        logger.info(f"    Already encoded  : {bm25_skipped}  (idempotent skip)")
+        logger.info(f"    No tokens        : {bm25_no_tokens}  (e.g. markdown table separators — expected)")
+        logger.info(f"    Errors           : {bm25_errors}  (encoding failures)")
+    logger.info("")
+
+    # Step 4 — Verification
+    logger.info("  STEP 4 — Verification")
+    count_icon = "✅" if verify_stats["count_ok"] else "❌"
+    logger.info(
+        f"    Count match      : {count_icon}  "
+        f"{verify_stats['new_count']} == {verify_stats['old_count']}"
+    )
+    bm25_text_total = verify_stats["bm25_ok"] + verify_stats["bm25_missing"]
+    coverage_icon = "✅" if verify_stats["bm25_coverage_ok"] else "❌"
+    logger.info(
+        f"    BM25 coverage    : {coverage_icon}  "
+        f"{verify_stats['bm25_ok']}/{bm25_text_total} text-bearing points "
+        f"({1 - verify_stats['bm25_missing_rate']:.1%} ok, "
+        f"{verify_stats['bm25_missing_rate']:.1%} missing)"
+    )
+    logger.info(f"    No-text points   : {verify_stats['bm25_no_text']}  (no sparse vector expected)")
+    logger.info("=" * 60)
+
+    if migration_ok:
         logger.warning("⚠️  ACTION REQUIRED — PLEASE READ:")
         logger.warning(f"  The new collection '{new_col}' is ready and contains all migrated data.")
         if env_updated:
@@ -628,13 +699,15 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
         logger.warning(f"     curl -X DELETE http://{host}:{port}/collections/{old_col}")
         logger.info("=" * 60)
     else:
-        logger.info("=" * 60)
-        logger.error("❌ MIGRATION FAILED VERIFICATION")
-        logger.error("   The new collection has issues. Do NOT update your .env yet.")
+        logger.error("  The new collection has issues. Do NOT update your .env yet.")
         if bm25_errors:
-            logger.error(f"   Additionally, {bm25_errors} point(s) had BM25 encoding errors.")
-        logger.error("   Re-run the script with --skip-copy to retry the BM25 encoding step:")
-        logger.error(f"     PYTHONPATH=. COLLECTION_NAME={old_col} .venv/bin/python3 scripts/migrate_to_sparse_vectors.py --new-collection {new_col} --skip-copy")
+            logger.error(f"  Additionally, {bm25_errors} point(s) had BM25 encoding errors.")
+        logger.error("  Re-run with --skip-copy to retry the BM25 encoding step:")
+        logger.error(
+            f"    PYTHONPATH=. COLLECTION_NAME={old_col} "
+            f".venv/bin/python3 scripts/migrate_to_sparse_vectors.py "
+            f"--new-collection {new_col} --skip-copy"
+        )
         logger.info("=" * 60)
         sys.exit(1)
 
@@ -666,14 +739,16 @@ def main() -> None:
 
     try:
         from app.core.clients.sparse_encoder import generate_sparse_vector
+        from app.services.document_operations.upload_service import _normalize_bm25_title
     except ImportError as exc:
-        logger.error(f"sparse_encoder import failed: {exc}. Run with PYTHONPATH=. from the vectorization-service root.")
+        logger.error(f"Import failed: {exc}. Run with PYTHONPATH=. from the vectorization-service root.")
         sys.exit(1)
 
     host = os.getenv("QDRANT_HOST", "127.0.0.1")
     port = int(os.getenv("QDRANT_PORT", "6333"))
-    collection = os.getenv("COLLECTION_NAME", "documents")
-    sparse_name = os.getenv("SPARSE_VECTOR_NAME", "bm25")
+    collection    = os.getenv("COLLECTION_NAME",         "documents")
+    text_vec_name  = os.getenv("SPARSE_TEXT_VECTOR_NAME",  "bm25_text")
+    title_vec_name = os.getenv("SPARSE_TITLE_VECTOR_NAME", "bm25_title")
 
     check_compat = os.getenv("QDRANT_CHECK_COMPATIBILITY", "false").lower() == "true"
     client = QdrantClient(host=host, port=port, check_compatibility=check_compat)
@@ -684,9 +759,11 @@ def main() -> None:
             client=client,
             old_col=collection,
             new_col=args.new_collection,
-            sparse_name=sparse_name,
+            text_vec_name=text_vec_name,
+            title_vec_name=title_vec_name,
             args=args,
             generate_sparse_vector=generate_sparse_vector,
+            normalize_bm25_title=_normalize_bm25_title,
             SparseVector=SparseVector,
             PointVectors=PointVectors,
             PointStruct=PointStruct,
@@ -700,9 +777,11 @@ def main() -> None:
         run_inplace(
             client=client,
             collection_name=collection,
-            sparse_name=sparse_name,
+            text_vec_name=text_vec_name,
+            title_vec_name=title_vec_name,
             args=args,
             generate_sparse_vector=generate_sparse_vector,
+            normalize_bm25_title=_normalize_bm25_title,
             SparseVector=SparseVector,
             PointVectors=PointVectors,
         )

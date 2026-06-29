@@ -108,22 +108,22 @@ class PrioritizedSearchService:
     def _build_result_items(self, top_results, include_scoring_debug: bool = False) -> List[SearchResultItem]:
         """Build result items from top results.
 
-        Strips the internal sparse (BM25) scoring key (SPARSE_VECTOR_NAME) before
-        serializing to the API response — it is a ranking internal, not a per-field
-        cosine similarity. Only float scores corresponding to actual dense vector
-        fields (title, tags, summary, metadata, text) are surfaced to the client.
+        Strips the internal sparse (BM25) scoring keys before serializing to the API
+        response — they are ranking internals, not per-field cosine similarities. Only
+        float scores corresponding to actual dense vector fields (title, tags, summary,
+        metadata, text) are surfaced to the client via field_scores.
 
         For documents injected via _fetch_field_match_docs (keyword/text-match only),
         field scores are None — meaning no vector similarity was computed for that
         field — rather than 0.0, which would be misleading.
 
         When include_scoring_debug is True, the hybrid fusion breakdown stashed by
-        _rank_results (keyword_score, rrf_score, dense_rank, sparse_rank) is surfaced
-        on each item; otherwise those stay None to keep responses lean.
+        _rank_results is surfaced on each item; otherwise those stay None.
         """
-        # Key used internally for ranking (raw BM25 score) but must not appear in
-        # the public field_scores contract.
-        INTERNAL_SCORE_KEYS = {settings.SPARSE_VECTOR_NAME}
+        INTERNAL_SCORE_KEYS = {settings.SPARSE_TEXT_VECTOR_NAME, settings.SPARSE_TITLE_VECTOR_NAME}
+
+        def _dbg(key):
+            return result_data.get(key) if include_scoring_debug else None
 
         result_items = []
         for result_data in top_results:
@@ -134,8 +134,7 @@ class PrioritizedSearchService:
                 title_match = field_scores.pop("title_match", None)
                 summary_match = field_scores.pop("summary_match", None)
 
-                # Remove the internal BM25 score key — it is fusion mechanics,
-                # not a per-field cosine similarity score.
+                # Remove internal BM25 score keys — fusion mechanics, not cosine scores.
                 for key in INTERNAL_SCORE_KEYS:
                     field_scores.pop(key, None)
 
@@ -151,10 +150,15 @@ class PrioritizedSearchService:
                     field_scores=field_scores,
                     title_match=title_match,
                     summary_match=summary_match,
-                    keyword_score=result_data.get('keyword_score') if include_scoring_debug else None,
-                    rrf_score=result_data.get('rrf_score') if include_scoring_debug else None,
-                    dense_rank=result_data.get('dense_rank') if include_scoring_debug else None,
-                    sparse_rank=result_data.get('sparse_rank') if include_scoring_debug else None,
+                    keyword_text_score=result_data.get('keyword_text_score'),
+                    keyword_title_score=result_data.get('keyword_title_score'),
+                    dense_score=_dbg('dense_score'),
+                    normalized_dense=_dbg('normalized_dense'),
+                    normalized_sparse=_dbg('normalized_sparse'),
+                    fusion_score=_dbg('fusion_score'),
+                    rrf_score=_dbg('rrf_score'),
+                    dense_rank=_dbg('dense_rank'),
+                    sparse_rank=_dbg('sparse_rank'),
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse result item {result_data.get('id')}: {str(e)}")
@@ -566,26 +570,29 @@ class PrioritizedSearchService:
                     )
                     valid_fields.append(field)
 
-            # 2. Build Query Request for BM25 Sparse Field
-            # Replace underscores with spaces so BM25 tokenises compound
-            # underscore-joined terms (e.g. "agentic_engineering") as separate
+            # 2. Build Query Requests for dual BM25 sparse fields (bm25_text + bm25_title).
+            # Replace underscores with spaces so BM25 tokenises compound terms as separate
             # words rather than a single unknown token that produces empty indices.
-            bm25_query_text = query_text.replace("_", " ")
-            sparse_indices, sparse_values = generate_sparse_vector(bm25_query_text)
-            if sparse_indices:
-                search_requests.append(
-                    QueryRequest(
-                        query=SparseVector(
-                            indices=sparse_indices,
-                            values=sparse_values,
-                        ),
-                        using=settings.SPARSE_VECTOR_NAME,
-                        limit=limit,
-                        with_payload=metadata_payload_fields,
-                        filter=filter_conditions
+            from app.services.document_operations.upload_service import _normalize_bm25_title
+            bm25_text_q  = query_text.replace("_", " ")
+            bm25_title_q = _normalize_bm25_title(bm25_text_q) or bm25_text_q
+
+            for vec_name, q_text in [
+                (settings.SPARSE_TEXT_VECTOR_NAME,  bm25_text_q),
+                (settings.SPARSE_TITLE_VECTOR_NAME, bm25_title_q),
+            ]:
+                s_indices, s_values = generate_sparse_vector(q_text)
+                if s_indices:
+                    search_requests.append(
+                        QueryRequest(
+                            query=SparseVector(indices=s_indices, values=s_values),
+                            using=vec_name,
+                            limit=limit,
+                            with_payload=metadata_payload_fields,
+                            filter=filter_conditions
+                        )
                     )
-                )
-                valid_fields.append(settings.SPARSE_VECTOR_NAME)
+                    valid_fields.append(vec_name)
 
             logger.info(f"Executing client-side hybrid batch search across {len(valid_fields)} fields: {valid_fields}")
             
@@ -601,11 +608,11 @@ class PrioritizedSearchService:
 
             # 4. Collect per-field raw similarity scores from the batch results.
             #    Each doc keeps the raw cosine score for every dense field that
-            #    retrieved it, plus the raw BM25 score under the sparse field key
-            #    (SPARSE_VECTOR_NAME) when the sparse query participated and returned
-            #    hits. The presence of that sparse key is what _rank_results uses to
-            #    detect hybrid mode and to fuse dense + sparse — the actual dense/sparse
-            #    fusion (weighted or two-list RRF) lives there, so there is no separate
+            #    retrieved it, plus the raw BM25 score under SPARSE_TEXT_VECTOR_NAME /
+            #    SPARSE_TITLE_VECTOR_NAME when those sparse queries participated and
+            #    returned hits. The presence of those sparse keys is what _rank_results
+            #    uses to detect hybrid mode and to fuse dense + sparse — the actual
+            #    dense+sparse fusion (weighted or two-list RRF) lives there, so there is no separate
             #    all-field RRF computed or stored here.
             all_results: Dict[str, Any] = {}
             field_scores: Dict[str, Dict[str, float]] = {}
@@ -627,9 +634,9 @@ class PrioritizedSearchService:
             #    named vectors with no prefix (see app/core/clients/qdrant.py), so the
             #    mapping is an identity today — but doing it explicitly keeps the
             #    field_scores contract correct if a prefix is ever introduced.
-            #    The "bm25" (SPARSE_VECTOR_NAME) key is preserved untouched — it carries
-            #    the raw BM25 score consumed by _rank_results' dense+sparse fusion and
-            #    signals hybrid mode.
+            #    The BM25 sparse keys (SPARSE_TEXT_VECTOR_NAME / SPARSE_TITLE_VECTOR_NAME)
+            #    are preserved untouched — they carry the raw BM25 scores consumed by
+            #    _rank_results' dense+sparse fusion and signal hybrid mode.
             prefix = getattr(settings, "VECTOR_FIELD_PREFIX", "") or ""
             qdrant_to_semantic = {
                 f"{prefix}{semantic}": semantic for semantic in self.default_weights
@@ -825,16 +832,19 @@ class PrioritizedSearchService:
         Returns:
             List of ranked results sorted by weighted score (descending)
         """
-        sparse_name = settings.SPARSE_VECTOR_NAME
-        # Hybrid mode is signalled by the presence of a raw sparse (BM25) score under
-        # the sparse field key — _hybrid_batch_search injects it only when the BM25
-        # query actually participated and returned hits. This is the same key the rrf/
-        # weighted fusion below reads as raw_sparse, so detection and fusion stay tied
-        # to one signal. Detecting it this way (rather than via a global flag or a
-        # separate all-field RRF marker) keeps the dense-only fallback and the
-        # empty-sparse edge case on the plain weighted-sum path, avoiding score
-        # deflation. In hybrid mode we fuse normalized dense + sparse scores.
-        is_hybrid = any(sparse_name in fs for fs in field_scores.values())
+        text_vec_name  = settings.SPARSE_TEXT_VECTOR_NAME
+        title_vec_name = settings.SPARSE_TITLE_VECTOR_NAME
+        # Hybrid mode is signalled by the presence of at least one BM25 sparse score
+        # (bm25_text or bm25_title) in any field_scores entry. _hybrid_batch_search
+        # injects these keys only when the BM25 queries actually participated and returned
+        # hits. If sparse search is enabled but no hits came back, log an informational
+        # message instead of silently scoring as pure-dense.
+        is_hybrid = any(
+            text_vec_name in fs or title_vec_name in fs
+            for fs in field_scores.values()
+        )
+        if settings.SPARSE_SEARCH_ENABLED and not is_hybrid:
+            logger.info("Sparse search returned zero results — documents may not have BM25 vectors yet")
 
         # Fusion method (env-selectable): "weighted" min-max score fusion, or "rrf"
         # rank fusion of the combined dense list vs the sparse list. The dense
@@ -843,11 +853,14 @@ class PrioritizedSearchService:
         fusion_method = settings.HYBRID_FUSION_METHOD
 
         norm_dense: Dict[Any, float] = {}
-        norm_sparse: Dict[Any, float] = {}
+        sparse_combined: Dict[Any, float] = {}
         hybrid_scores: Dict[Any, float] = {}
         # Diagnostic maps surfaced via include_scoring_debug (empty outside hybrid /
         # the rrf branch, so .get() yields None for those results).
-        raw_sparse: Dict[Any, float] = {}
+        raw_text:     Dict[Any, float] = {}   # raw bm25_text scores (0.0 when absent)
+        raw_title:    Dict[Any, float] = {}   # raw bm25_title scores (0.0 when absent)
+        display_text:  Dict[Any, Any]  = {}   # bm25_text raw score, preserving None for "no hit"
+        display_title: Dict[Any, Any]  = {}   # bm25_title raw score, preserving None for "no hit"
         rrf_raw: Dict[Any, float] = {}
         dense_rank: Dict[Any, int] = {}
         sparse_rank: Dict[Any, int] = {}
@@ -860,20 +873,41 @@ class PrioritizedSearchService:
                         score = fs.get(field)
                         if score is not None:
                             dense += score * weights[field]
-                raw_dense[point_id] = dense
-                raw_sparse[point_id] = fs.get(sparse_name) or 0.0
+                raw_dense[point_id]    = dense
+                raw_text[point_id]     = fs.get(text_vec_name)  or 0.0
+                raw_title[point_id]    = fs.get(title_vec_name) or 0.0
+                display_text[point_id]  = fs.get(text_vec_name)   # None = "no BM25 hit"
+                display_title[point_id] = fs.get(title_vec_name)  # None = "no BM25 hit"
+
+            # sparse_combined: per-field normalize then weighted blend → [0, 1].
+            # Per-field normalization is needed because title BM25 and text BM25 operate
+            # on very different corpus sizes and produce different raw score magnitudes.
+            norm_dense  = self._min_max_normalize(raw_dense)
+            norm_text   = self._min_max_normalize(raw_text)
+            norm_title  = self._min_max_normalize(raw_title)
+            ts, xs = settings.SPARSE_TITLE_SHARE, settings.SPARSE_TEXT_SHARE
+            total_s = ts + xs
+            for pid in raw_dense:
+                sparse_combined[pid] = (
+                    ts * norm_title.get(pid, 0.0) + xs * norm_text.get(pid, 0.0)
+                ) / total_s
 
             if fusion_method == "rrf":
                 # Reciprocal Rank Fusion over two lists: the combined dense list
-                # (ranked by the weighted multi-field cosine sum) and the sparse
-                # list. This keeps the dense weighting intact (constraint) while
-                # fusing by rank position rather than raw score.
+                # (ranked by the weighted multi-field cosine sum) and the sparse list.
+                # CORRECTNESS: use raw pre-normalization scores to identify actual BM25 hits.
+                # Min-max maps the lowest actual scorer to 0.0; filtering sparse_combined > 0
+                # would silently drop that document from sparse_rank. Instead check raw.
                 rrf_k = settings.RRF_K
                 dense_hits = {pid: s for pid, s in raw_dense.items() if s > 0.0}
                 dense_rank = self._rank_positions(dense_hits)
-                # Only docs with an actual sparse hit get a sparse rank.
-                sparse_hits = {pid: s for pid, s in raw_sparse.items() if s > 0.0}
-                sparse_rank = self._rank_positions(sparse_hits)
+                sparse_actual_hits = {
+                    pid for pid in raw_dense
+                    if raw_title.get(pid, 0.0) > 0.0 or raw_text.get(pid, 0.0) > 0.0
+                }
+                sparse_rank = self._rank_positions(
+                    {pid: sparse_combined[pid] for pid in sparse_actual_hits}
+                )
                 for point_id in raw_dense:
                     fused = 0.0
                     if point_id in dense_rank:
@@ -881,20 +915,18 @@ class PrioritizedSearchService:
                     if point_id in sparse_rank:
                         fused += 1.0 / (rrf_k + sparse_rank[point_id])
                     rrf_raw[point_id] = fused
-                # Normalize to [0, 1] so filter_score keeps a comparable scale
-                # (raw RRF values are ~0-0.03 and would never clear a threshold).
+                # Normalize to [0, 1] so filter_score keeps a comparable scale.
                 # rrf_raw is retained for debug surfacing (pre-normalization).
                 hybrid_scores = self._min_max_normalize(rrf_raw)
             else:
                 # Weighted min-max score fusion (default).
-                norm_dense = self._min_max_normalize(raw_dense)
-                norm_sparse = self._min_max_normalize(raw_sparse)
+                # sparse_combined is already [0, 1] — use it directly.
                 dense_w = settings.HYBRID_DENSE_WEIGHT
                 sparse_w = settings.HYBRID_SPARSE_WEIGHT
                 for point_id in raw_dense:
                     hybrid_scores[point_id] = (
                         dense_w * norm_dense.get(point_id, 0.0)
-                        + sparse_w * norm_sparse.get(point_id, 0.0)
+                        + sparse_w * sparse_combined.get(point_id, 0.0)
                     )
 
         ranked = []
@@ -916,7 +948,8 @@ class PrioritizedSearchService:
 
             # Do NOT cap at 1.0 here — the title/summary boost (applied later) needs
             # the uncapped score to differentiate matches, and enforces its own cap.
-            num_fields_matched = len([k for k in field_score_dict.keys() if k != sparse_name])
+            _sparse_keys = {text_vec_name, title_vec_name}
+            num_fields_matched = len([k for k in field_score_dict.keys() if k not in _sparse_keys])
 
             entry = {
                 'id': result.id,
@@ -927,12 +960,18 @@ class PrioritizedSearchService:
             }
             if is_hybrid:
                 # Internal scoring diagnostics, surfaced only when the request sets
-                # include_scoring_debug (see _build_result_items). rrf_score /
-                # dense_rank / sparse_rank are None outside the rrf fusion branch.
-                entry['keyword_score'] = raw_sparse.get(point_id)
-                entry['rrf_score'] = rrf_raw.get(point_id)
-                entry['dense_rank'] = dense_rank.get(point_id)
-                entry['sparse_rank'] = sparse_rank.get(point_id)
+                # include_scoring_debug (see _build_result_items).
+                # keyword_text_score / keyword_title_score are None when the document
+                # had no BM25 hit — distinct from a genuine score of 0.0.
+                entry['keyword_text_score']  = display_text.get(point_id)
+                entry['keyword_title_score'] = display_title.get(point_id)
+                entry['dense_score']         = raw_dense.get(point_id)
+                entry['normalized_dense']    = norm_dense.get(point_id)
+                entry['normalized_sparse']   = sparse_combined.get(point_id)
+                entry['fusion_score']        = hybrid_scores.get(point_id)
+                entry['rrf_score']           = rrf_raw.get(point_id)
+                entry['dense_rank']          = dense_rank.get(point_id)
+                entry['sparse_rank']         = sparse_rank.get(point_id)
             ranked.append(entry)
 
         ranked.sort(key=lambda x: x['weighted_score'], reverse=True)
