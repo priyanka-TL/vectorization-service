@@ -161,6 +161,20 @@ class Settings(BaseSettings):
                 f"HYBRID_DENSE_WEIGHT + HYBRID_SPARSE_WEIGHT must not exceed 1.0 "
                 f"(got {dw} + {sw} = {dw + sw:.6f})"
             )
+        ts, xs = self.SPARSE_TITLE_SHARE, self.SPARSE_TEXT_SHARE
+        if not (math.isfinite(ts) and ts >= 0.0):
+            raise ValueError(
+                f"SPARSE_TITLE_SHARE must be a finite non-negative number, got {ts}"
+            )
+        if not (math.isfinite(xs) and xs >= 0.0):
+            raise ValueError(
+                f"SPARSE_TEXT_SHARE must be a finite non-negative number, got {xs}"
+            )
+        if ts + xs <= 0.0:
+            raise ValueError(
+                f"SPARSE_TITLE_SHARE + SPARSE_TEXT_SHARE must be > 0 "
+                f"(got {ts} + {xs} = {ts + xs})"
+            )
         return self
 
 

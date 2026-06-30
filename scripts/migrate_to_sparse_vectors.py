@@ -289,12 +289,15 @@ def run_inplace(client, collection_name: str, text_vec_name: str, title_vec_name
 
 # ── Blue-green mode ───────────────────────────────────────────────────────────
 
-def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> tuple[bool, dict]:
+def _verify_migration(client, old_col: str, new_col: str, sparse_name: str, title_vec_name: str,
+                      normalize_bm25_title) -> tuple[bool, dict]:
     """Deep verification of the blue-green migration.
 
     Checks:
       1. Point count in new collection matches old collection.
-      2. BM25 missing rate across ALL points is under 10%.
+      2. BM25 text missing rate across ALL points is under 10% (hard failure).
+      3. BM25 title missing rate across title-bearing points is under 50% (warning only —
+         bm25_title is optional; many documents legitimately have no title).
 
     Returns (passed, stats) where stats contains all counts for the final summary.
     """
@@ -305,6 +308,8 @@ def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> t
         "old_count": 0, "new_count": 0, "count_ok": False,
         "bm25_ok": 0, "bm25_missing": 0, "bm25_no_text": 0,
         "bm25_missing_rate": 0.0, "bm25_coverage_ok": False,
+        "title_ok": 0, "title_missing": 0, "title_no_title": 0,
+        "title_missing_rate": 0.0, "title_coverage_ok": False,
     }
 
     # Check 1: Point count
@@ -330,13 +335,16 @@ def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> t
         bm25_ok = 0
         bm25_missing = 0
         bm25_no_text = 0
+        title_ok = 0
+        title_missing = 0
+        title_no_title = 0
         offset = None
         while True:
             scroll_kw = dict(
                 collection_name=new_col,
                 limit=500,
-                with_payload=["text"],
-                with_vectors=[sparse_name],
+                with_payload=["text", "title"],
+                with_vectors=[sparse_name, title_vec_name],
             )
             if offset is not None:
                 scroll_kw["offset"] = offset
@@ -351,6 +359,16 @@ def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> t
                     bm25_ok += 1
                 else:
                     bm25_missing += 1
+                raw_title = (p.payload or {}).get("title") or ""
+                title_str = normalize_bm25_title(raw_title)
+                if not title_str:
+                    title_no_title += 1
+                else:
+                    tv = (getattr(p, "vector", {}) or {}).get(title_vec_name)
+                    if tv and getattr(tv, "indices", None):
+                        title_ok += 1
+                    else:
+                        title_missing += 1
             if not next_offset:
                 break
             offset = next_offset
@@ -373,6 +391,28 @@ def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> t
         else:
             stats["bm25_coverage_ok"] = True
             logger.info(f"  ✅ BM25 check passed (missing rate {missing_rate:.1%} ≤ 10%)")
+
+        # Title BM25 check — warning-only; bm25_title is optional
+        total_title = title_ok + title_missing
+        title_missing_rate = title_missing / total_title if total_title else 0.0
+        stats["title_ok"] = title_ok
+        stats["title_missing"] = title_missing
+        stats["title_no_title"] = title_no_title
+        stats["title_missing_rate"] = title_missing_rate
+        logger.info(
+            f"  Title BM25 check ({total_title} title-bearing points): "
+            f"ok={title_ok}, missing={title_missing} ({title_missing_rate:.1%}), no_title={title_no_title}"
+        )
+        _TITLE_MISSING_THRESHOLD = 0.50
+        if title_missing_rate > _TITLE_MISSING_THRESHOLD:
+            logger.warning(
+                f"  ⚠️  Title BM25 missing rate {title_missing_rate:.1%} exceeds "
+                f"{_TITLE_MISSING_THRESHOLD:.0%} threshold (non-blocking — title is optional)."
+            )
+            stats["title_coverage_ok"] = False
+        else:
+            stats["title_coverage_ok"] = True
+            logger.info(f"  ✅ Title BM25 check passed (missing rate {title_missing_rate:.1%} ≤ 50%)")
     except Exception as exc:
         logger.error(f"  ❌ BM25 check error: {exc}")
         passed = False
@@ -624,7 +664,9 @@ def run_bluegreen(client, old_col: str, new_col: str,
         logger.info("[DRY RUN] Skipping verification and .env update.")
         return
 
-    migration_ok, verify_stats = _verify_migration(client, old_col, new_col, text_vec_name)
+    migration_ok, verify_stats = _verify_migration(
+        client, old_col, new_col, text_vec_name, title_vec_name, normalize_bm25_title
+    )
 
     host = os.getenv("QDRANT_HOST", "127.0.0.1")
     port = os.getenv("QDRANT_PORT", "6333")
@@ -678,12 +720,21 @@ def run_bluegreen(client, old_col: str, new_col: str,
     bm25_text_total = verify_stats["bm25_ok"] + verify_stats["bm25_missing"]
     coverage_icon = "✅" if verify_stats["bm25_coverage_ok"] else "❌"
     logger.info(
-        f"    BM25 coverage    : {coverage_icon}  "
+        f"    BM25 text        : {coverage_icon}  "
         f"{verify_stats['bm25_ok']}/{bm25_text_total} text-bearing points "
         f"({1 - verify_stats['bm25_missing_rate']:.1%} ok, "
         f"{verify_stats['bm25_missing_rate']:.1%} missing)"
     )
     logger.info(f"    No-text points   : {verify_stats['bm25_no_text']}  (no sparse vector expected)")
+    bm25_title_total = verify_stats["title_ok"] + verify_stats["title_missing"]
+    title_icon = "✅" if verify_stats["title_coverage_ok"] else "⚠️ "
+    logger.info(
+        f"    BM25 title       : {title_icon}  "
+        f"{verify_stats['title_ok']}/{bm25_title_total} title-bearing points "
+        f"({1 - verify_stats['title_missing_rate']:.1%} ok, "
+        f"{verify_stats['title_missing_rate']:.1%} missing)  [non-blocking]"
+    )
+    logger.info(f"    No-title points  : {verify_stats['title_no_title']}  (title empty/absent — expected)")
     logger.info("=" * 60)
 
     if migration_ok:

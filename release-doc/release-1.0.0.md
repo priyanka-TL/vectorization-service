@@ -87,8 +87,8 @@ When sparse search is disabled, 5 field queries run in a single batch and are me
 
 Applied after semantic ranking when `HYBRID_SEARCH_ENABLED=true` and `search_mode != "semantic"`:
 
-- **Exact match** → multiply score by boost (title ×2.5, summary ×1.4), capped at 1.0
-- **Partial/mid match** → multiply by lower boost (title ×1.5, summary ×1.2), capped at 1.0
+- **Exact match** → multiply score by boost (title ×2.0, summary ×1.3), capped at 1.0
+- **Partial/mid match** → multiply by lower boost (title ×1.2, summary ×1.1), capped at 1.0
 - **Missing docs** (matched keyword but below semantic threshold) → injected at a floor score (0.15 × boost)
 
 Title boost takes precedence — a doc matching both title and summary only gets the title boost.
