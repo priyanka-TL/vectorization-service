@@ -97,13 +97,12 @@ async def ensure_collections_exist():
                 try:
                     from qdrant_client.models import SparseVectorParams, Modifier  # type: ignore[import]
                     create_kwargs["sparse_vectors_config"] = {
-                        settings.SPARSE_VECTOR_NAME: SparseVectorParams(
-                            modifier=Modifier.IDF
-                        )
+                        settings.SPARSE_TEXT_VECTOR_NAME:  SparseVectorParams(modifier=Modifier.IDF),
+                        settings.SPARSE_TITLE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF),
                     }
                     logger.info(
-                        f"Sparse vector field '{settings.SPARSE_VECTOR_NAME}' "
-                        "added to collection config"
+                        f"Sparse vector fields '{settings.SPARSE_TEXT_VECTOR_NAME}' and "
+                        f"'{settings.SPARSE_TITLE_VECTOR_NAME}' added to collection config"
                     )
                 except ImportError:
                     logger.warning(
@@ -112,8 +111,9 @@ async def ensure_collections_exist():
                     )
             qdrant_client.create_collection(**create_kwargs)
         elif settings.SPARSE_SEARCH_ENABLED:
-            # Collection already exists — try to add the sparse vector field non-destructively.
-            _ensure_sparse_vector_field(settings.COLLECTION_NAME)
+            # Collection already exists — add both sparse vector fields non-destructively.
+            _ensure_sparse_vector_field(settings.COLLECTION_NAME, settings.SPARSE_TEXT_VECTOR_NAME)
+            _ensure_sparse_vector_field(settings.COLLECTION_NAME, settings.SPARSE_TITLE_VECTOR_NAME)
 
         if settings.QA_CACHE_COLLECTION not in collection_names:
             logger.info(f"Creating collection: {settings.QA_CACHE_COLLECTION}")
@@ -132,8 +132,8 @@ async def ensure_collections_exist():
         raise
 
 
-def _ensure_sparse_vector_field(collection_name: str) -> None:
-    """Add the BM25 sparse vector field to an existing collection.
+def _ensure_sparse_vector_field(collection_name: str, field_name: str) -> None:
+    """Add a BM25 sparse vector field to an existing collection.
 
     Uses ``update_collection`` which is non-destructive — dense vectors and
     existing payload are preserved. Requires qdrant-client>=1.9.0 and a
@@ -149,25 +149,23 @@ def _ensure_sparse_vector_field(collection_name: str) -> None:
         return
 
     from qdrant_client.http.exceptions import UnexpectedResponse
-    from app.config import settings as _s
 
     try:
         qdrant_client.update_collection(
             collection_name=collection_name,
             sparse_vectors_config={
-                _s.SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF)
+                field_name: SparseVectorParams(modifier=Modifier.IDF)
             },
         )
         logger.info(
-            f"Sparse vector field '{_s.SPARSE_VECTOR_NAME}' "
+            f"Sparse vector field '{field_name}' "
             f"added/verified on existing collection '{collection_name}'"
         )
     except UnexpectedResponse as exc:
         content = exc.content.decode("utf-8", errors="replace").lower()
         if "already" in content:
-            # Benign: field is already present; update_collection is idempotent.
             logger.debug(
-                f"Sparse vector field already present on '{collection_name}', skipping update"
+                f"Sparse vector field '{field_name}' already present on '{collection_name}', skipping update"
             )
         else:
             logger.error(

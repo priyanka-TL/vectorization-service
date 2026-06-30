@@ -74,19 +74,24 @@ class Settings(BaseSettings):
 
     # Hybrid Search Configuration (Phase 1 — works with qdrant-client<=1.6.9)
     HYBRID_SEARCH_ENABLED: bool = os.getenv("HYBRID_SEARCH_ENABLED", "true").lower() == "true"
-    EXACT_TITLE_BOOST: float = float(os.getenv("EXACT_TITLE_BOOST", "2.5"))
-    PARTIAL_TITLE_BOOST: float = float(os.getenv("PARTIAL_TITLE_BOOST", "1.5"))
-    # Summary boosts are lower than title (summary carries less weight than title).
-    EXACT_SUMMARY_BOOST: float = float(os.getenv("EXACT_SUMMARY_BOOST", "1.4"))
-    PARTIAL_SUMMARY_BOOST: float = float(os.getenv("PARTIAL_SUMMARY_BOOST", "1.2"))
+    EXACT_TITLE_BOOST: float = float(os.getenv("EXACT_TITLE_BOOST", "2.0"))
+    PARTIAL_TITLE_BOOST: float = float(os.getenv("PARTIAL_TITLE_BOOST", "1.2"))
+    EXACT_SUMMARY_BOOST: float = float(os.getenv("EXACT_SUMMARY_BOOST", "1.3"))
+    PARTIAL_SUMMARY_BOOST: float = float(os.getenv("PARTIAL_SUMMARY_BOOST", "1.1"))
     METADATA_MATCH_BOOST: float = float(os.getenv("METADATA_MATCH_BOOST", "1.2"))
     # Queries shorter than this word count skip spaCy stop-word removal
     SHORT_QUERY_THRESHOLD: int = int(os.getenv("SHORT_QUERY_THRESHOLD", "3"))
     RRF_K: int = int(os.getenv("RRF_K", "60"))  # standard Reciprocal Rank Fusion constant
 
     # Sparse Vector Configuration (Phase 2 — requires qdrant-client>=1.9.0)
-    SPARSE_VECTOR_NAME: str = os.getenv("SPARSE_VECTOR_NAME", "bm25")
-    SPARSE_SEARCH_ENABLED: bool = os.getenv("SPARSE_SEARCH_ENABLED", "false").lower() == "true"
+    SPARSE_SEARCH_ENABLED: bool = os.getenv("SPARSE_SEARCH_ENABLED", "true").lower() == "true"
+    SPARSE_TEXT_VECTOR_NAME:  str = os.getenv("SPARSE_TEXT_VECTOR_NAME",  "bm25_text")
+    SPARSE_TITLE_VECTOR_NAME: str = os.getenv("SPARSE_TITLE_VECTOR_NAME", "bm25_title")
+
+    # Per-field share weights within the sparse modality. Normalized internally;
+    # do not need to sum to 1.0.
+    SPARSE_TITLE_SHARE: float = float(os.getenv("SPARSE_TITLE_SHARE", "0.45"))
+    SPARSE_TEXT_SHARE:  float = float(os.getenv("SPARSE_TEXT_SHARE",  "0.55"))
 
     # Hybrid score fusion weights. In hybrid mode the dense (cosine) and sparse
     # (BM25) scores are each min-max normalized to [0, 1] across the candidate
@@ -110,10 +115,10 @@ class Settings(BaseSettings):
     HYBRID_FUSION_METHOD: str = os.getenv("HYBRID_FUSION_METHOD", "weighted").lower()
 
     # Default for the per-request `include_scoring_debug` flag. When true, search
-    # responses surface the hybrid fusion breakdown (keyword_score, rrf_score,
-    # dense_rank, sparse_rank) on every result. A request may still override this
-    # per call by sending include_scoring_debug explicitly. Keep false in
-    # production (responses stay lean given the large default top_k).
+    # responses surface the hybrid fusion breakdown (keyword_text_score,
+    # keyword_title_score, dense_score, normalized_dense, normalized_sparse,
+    # fusion_score, rrf_score, dense_rank, sparse_rank) on every result.
+    # A request may still override this per call. Keep false in production.
     INCLUDE_SCORING_DEBUG: bool = os.getenv("INCLUDE_SCORING_DEBUG", "false").lower() == "true"
 
     # Candidate pool sizing for multi-field search. Each dense named-vector search
@@ -155,6 +160,20 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"HYBRID_DENSE_WEIGHT + HYBRID_SPARSE_WEIGHT must not exceed 1.0 "
                 f"(got {dw} + {sw} = {dw + sw:.6f})"
+            )
+        ts, xs = self.SPARSE_TITLE_SHARE, self.SPARSE_TEXT_SHARE
+        if not (math.isfinite(ts) and ts >= 0.0):
+            raise ValueError(
+                f"SPARSE_TITLE_SHARE must be a finite non-negative number, got {ts}"
+            )
+        if not (math.isfinite(xs) and xs >= 0.0):
+            raise ValueError(
+                f"SPARSE_TEXT_SHARE must be a finite non-negative number, got {xs}"
+            )
+        if ts + xs <= 0.0:
+            raise ValueError(
+                f"SPARSE_TITLE_SHARE + SPARSE_TEXT_SHARE must be > 0 "
+                f"(got {ts} + {xs} = {ts + xs})"
             )
         return self
 
