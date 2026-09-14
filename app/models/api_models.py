@@ -195,6 +195,16 @@ class SearchResultItem(BaseModel):
             "for unscored fields to distinguish them from a genuine zero-score."
         )
     )
+    match_source: Optional[str] = Field(
+        default=None,
+        description="Set only on documents injected by the title/summary keyword-match step "
+                    "(e.g. 'title_keyword_match'). Their `score` is a synthetic floor derived "
+                    "from FLOOR_SCORE x boost, NOT a fused semantic score, so it is not "
+                    "comparable to the scores of semantically retrieved results. None for "
+                    "normal results. A response in which every item carries this value is a "
+                    "degraded result set: the semantic pool was emptied by the score "
+                    "threshold and only literal keyword matches remain."
+    )
     keyword_score: Optional[float] = Field(
         default=None,
         description="Raw BM25 sparse vector score (Phase 2). Surfaced BY DEFAULT whenever "
