@@ -197,13 +197,11 @@ class SearchResultItem(BaseModel):
     )
     match_source: Optional[str] = Field(
         default=None,
-        description="Set only on documents injected by the title/summary keyword-match step "
-                    "(e.g. 'title_keyword_match'). Their `score` is a synthetic floor derived "
-                    "from FLOOR_SCORE x boost, NOT a fused semantic score, so it is not "
-                    "comparable to the scores of semantically retrieved results. None for "
-                    "normal results. A response in which every item carries this value is a "
-                    "degraded result set: the semantic pool was emptied by the score "
-                    "threshold and only literal keyword matches remain."
+        description="Set only on documents injected by the title/summary keyword-match "
+                    "step (e.g. 'title_keyword_match'); None otherwise. Their `score` is "
+                    "a synthetic floor (FLOOR_SCORE x boost), not a fused semantic score, "
+                    "so it is not comparable to semantically retrieved results. If every "
+                    "item carries it, the score threshold emptied the semantic pool."
     )
     keyword_score: Optional[float] = Field(
         default=None,

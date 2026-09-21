@@ -517,18 +517,12 @@ class PrioritizedSearchService:
                     "metadata": detail_filter_score.metadata
                 }
 
-            # Additive debug block: expose the per-query normalization reference + boost
-            # config so QA can reproduce normalized_dense/normalized_sparse and the boost
-            # step by hand. Only when include_scoring_debug is set (keeps prod responses
-            # lean). scoring_context already holds candidate_pool_size and, in hybrid mode,
-            # dense_min/max + sparse_min/max from _rank_results; augment with the fusion
-            # weights and the boost multiplier table (all from settings).
+            # Debug-only (off by default to keep prod responses lean). _rank_results has
+            # already filled scoring_context; add just the boost multipliers.
             if request.include_scoring_debug:
-                # setdefault, not assignment: _rank_results already recorded the weights it
-                # actually applied (which differ from config when sparse matched nothing).
-                # These are the fallback for paths that never reached the weighted fusion.
-                scoring_context.setdefault("dense_weight", settings.HYBRID_DENSE_WEIGHT)
-                scoring_context.setdefault("sparse_weight", settings.HYBRID_SPARSE_WEIGHT)
+                # Never default dense_weight/sparse_weight from settings: _rank_results
+                # writes them only where weighted fusion ran, so their absence is the
+                # signal that it didn't (dense-only, empty-BM25, RRF).
                 scoring_context["boost_config"] = {
                     "exact_title_boost": settings.EXACT_TITLE_BOOST,
                     "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
@@ -648,12 +642,9 @@ class PrioritizedSearchService:
         To minimize network bandwidth and memory footprint, payloads are projected to exclude
         heavy text content; full payloads are fetched late for the final top results.
 
-        Returns (all_results, field_scores, sparse_issued). ``sparse_issued`` reports whether
-        the BM25 query was actually sent to Qdrant — NOT whether it matched anything. It is the
-        signal _rank_results uses to pick the scoring formula, so that a sparse branch which
-        returns zero hits (a narrow filter, or a rare term absent from the filtered subset)
-        keeps the hybrid [0, 1] scale instead of silently switching to the raw weighted cosine
-        sum. Those are different units, and a single filter_score cannot be valid for both.
+        Returns (all_results, field_scores, sparse_issued), where ``sparse_issued`` means the
+        BM25 query was SENT, not that it matched — _rank_results needs that distinction to
+        keep zero-hit sparse queries on the hybrid [0, 1] scale.
         """
         try:
             from qdrant_client.models import QueryRequest, SparseVector
@@ -1027,50 +1018,35 @@ class PrioritizedSearchService:
         filter_score, instead of the raw RRF fused value (~0-0.1) which never clears a
         cosine-scale threshold.
 
-        Note: hybrid mode follows the ``sparse_issued`` flag — whether the BM25 query was
-        sent — NOT whether it returned hits. A sparse branch that matches nothing still
-        keeps this path, with its weight shifted onto dense, so the score stays on the
-        hybrid [0, 1] scale. The
-        "rrf" fusion method below computes its own RRF over exactly TWO lists — the
-        single combined dense list (the 5 dense fields collapsed into one weighted
-        cosine sum, raw_dense) and the sparse list (raw_sparse) — i.e. up to two rank
-        terms per doc, NOT one RRF term per dense field. _apply_detail_filter is pure
-        per-field OR logic and does not consume any fusion score.
+        Two easy mistakes:
+          - Hybrid mode follows ``sparse_issued`` (query sent), NOT whether it matched;
+            a zero-hit sparse branch stays here with its weight shifted onto dense.
+          - "rrf" fuses TWO lists — the combined dense list and the sparse list — so a
+            doc gets at most two rank terms, not one per dense field.
 
         Args:
             all_results: Dictionary of search results by point ID
             field_scores: Scores for each field per point
             weights: Weight configuration for each field
             search_fields: List of fields searched
-            scoring_context_out: Optional mutable dict. When provided, it is populated
-                with the per-query normalization context (candidate_pool_size and, in
-                hybrid mode, dense_min/max + sparse_min/max) so the caller can surface it
-                under search_config.scoring_context without recomputing raw_dense/raw_sparse
-                or keeping per-request state on the (shared) service instance. Left empty
-                on the dense-only path except for candidate_pool_size.
+            scoring_context_out: Optional mutable dict, filled with the per-query scoring
+                context for search_config.scoring_context. Keys:
+                  candidate_pool_size, sparse_issued, sparse_has_hits — every path; the
+                      flags describe retrieval, not fusion.
+                  dense_min/max, sparse_min/max — hybrid only.
+                  dense_weight, sparse_weight — weighted-fusion branch only, with the
+                      weights actually applied (1.0/0.0 if sparse matched nothing).
+                      Absent elsewhere; never back-fill from settings.
 
         Returns:
             List of ranked results sorted by weighted score (descending)
         """
         sparse_name = settings.SPARSE_VECTOR_NAME
-        # Hybrid mode follows whether the BM25 branch was ISSUED, not whether it matched.
-        #
-        # This used to be `any(sparse_name in fs for fs in field_scores.values())` — derived
-        # from retrieved data — which meant a sparse branch returning zero hits silently
-        # switched the scoring formula from the normalized [0, 1] fusion below to the raw
-        # weighted cosine sum further down. Those are different units (the raw sum tops out
-        # around 0.3), so a single filter_score could not be valid for both: a narrowing
-        # filter that excluded every BM25 match would drop the whole result set below the
-        # threshold and return only keyword-injected fallbacks. Tying the decision to the
-        # request we sent keeps one scale for every query.
-        #
-        # Empty sparse hits are handled by weight redistribution at the fusion step instead,
-        # which is what avoids the score deflation the old comment here warned about.
-        #
-        # The `or` keeps the old data-driven signal as a floor rather than replacing it:
-        # sparse hits cannot exist unless the branch ran, so their presence means hybrid even
-        # if a caller forgot the flag. That way the default sparse_issued=False can never
-        # silently drop a genuinely hybrid pool back onto the raw-cosine scale.
+        # Keys off whether the BM25 branch was ISSUED, not whether it matched: a zero-hit
+        # sparse branch would otherwise flip scoring from the normalized [0, 1] fusion to
+        # the raw cosine sum (~0.3 max), and no single filter_score spans both. Zero hits
+        # are handled by weight redistribution in the `weighted` branch instead.
+        # sparse_has_hits is a floor, not a replacement: hits imply hybrid without the flag.
         sparse_has_hits = any(sparse_name in fs for fs in field_scores.values())
         is_hybrid = sparse_issued or sparse_has_hits
 
@@ -1131,11 +1107,9 @@ class PrioritizedSearchService:
                     dense_w = settings.HYBRID_DENSE_WEIGHT
                     sparse_w = settings.HYBRID_SPARSE_WEIGHT
                 else:
-                    # The sparse branch ran but matched nothing, so every norm_sparse is 0.
-                    # Keeping the configured 0.7 would scale every score down by 0.3 purely
-                    # because a modality was silent, pushing otherwise-good results under
-                    # filter_score. Give dense the full weight so the scale is preserved and
-                    # the threshold keeps the same meaning.
+                    # Sparse ran but matched nothing, so norm_sparse is all 0. Keeping 0.7
+                    # would shrink every score by 0.3 for a silent modality and push good
+                    # results under filter_score; dense takes the full share instead.
                     dense_w, sparse_w = 1.0, 0.0
                     logger.info(
                         "No sparse hits in candidate pool; dense weight raised to 1.0 "
@@ -1166,12 +1140,15 @@ class PrioritizedSearchService:
                 if fusion_method != "rrf":
                     scoring_context_out["dense_weight"] = dense_w
                     scoring_context_out["sparse_weight"] = sparse_w
-                scoring_context_out["sparse_issued"] = sparse_issued
-                scoring_context_out["sparse_has_hits"] = sparse_has_hits
 
         # candidate_pool_size is meaningful in both modes.
         if scoring_context_out is not None:
             scoring_context_out["candidate_pool_size"] = len(all_results)
+            # Retrieval facts, every path — unlike dense_weight/sparse_weight above, which
+            # report fusion. Outside `if is_hybrid` so a client can tell "never issued"
+            # from "ran but contributed nothing".
+            scoring_context_out["sparse_issued"] = sparse_issued
+            scoring_context_out["sparse_has_hits"] = sparse_has_hits
 
         ranked = []
 
@@ -1583,9 +1560,8 @@ class PrioritizedSearchService:
             entry["field_scores"][match_key] = match_type
             entry["weighted_score"] = score
             entry[mult_key] = boost
-            # Mark the score as a keyword-match floor, not a semantic one. Without this an
-            # all-injected response is indistinguishable from a real result set — which is
-            # what hid the filter/scale bug: every row simply read as exactly filter_score.
+            # Marks the score as a keyword-match floor, not a semantic one; otherwise an
+            # all-injected response is indistinguishable from a real result set.
             entry["match_source"] = f"{field}_keyword_match"
             injected.append(entry)
             logger.debug(
