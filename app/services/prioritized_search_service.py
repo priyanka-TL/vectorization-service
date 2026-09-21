@@ -328,7 +328,10 @@ class PrioritizedSearchService:
             
             logger.info("========== EXECUTING SEARCH ==========" )
             if settings.SPARSE_SEARCH_ENABLED:
-                logger.info("Starting hybrid batch search (dense + BM25 sparse, RRF fusion)")
+                logger.info(
+                    "Starting hybrid batch search (dense + BM25 sparse, "
+                    f"{settings.HYBRID_FUSION_METHOD} fusion)"
+                )
                 all_results, field_scores, sparse_issued = self._hybrid_batch_search(
                     search_fields=search_fields,
                     query_text=query_for_embedding,
@@ -340,8 +343,8 @@ class PrioritizedSearchService:
                 )
             else:
                 logger.info("Starting parallel batch search across all fields")
-                # Sparse search is switched off for this deployment, so the dense-only
-                # weighted-cosine-sum path is the intended, self-consistent scoring.
+                # No sparse branch on this path, so there is no BM25 query to fuse and the
+                # raw weighted-cosine-sum is the correct scoring.
                 sparse_issued = False
                 all_results, field_scores = self._parallel_batch_search(
                     search_fields=search_fields,
@@ -517,8 +520,8 @@ class PrioritizedSearchService:
                     "metadata": detail_filter_score.metadata
                 }
 
-            # Debug-only (off by default to keep prod responses lean). _rank_results has
-            # already filled scoring_context; add just the boost multipliers.
+            # Gated by include_scoring_debug to keep prod responses lean. _rank_results
+            # has already filled scoring_context; add just the boost multipliers.
             if request.include_scoring_debug:
                 # Never default dense_weight/sparse_weight from settings: _rank_results
                 # writes them only where weighted fusion ran, so their absence is the
@@ -634,7 +637,9 @@ class PrioritizedSearchService:
         filter_conditions: Optional[models.Filter],
         limit: int,
     ) -> tuple[Dict[str, Any], Dict[str, Dict[str, float]], bool]:
-        """Execute hybrid search using parallel batch queries with client-side RRF fusion.
+        """Execute hybrid search using parallel batch queries with client-side fusion.
+
+        The fusion method is selected by HYBRID_FUSION_METHOD ("weighted" or "rrf").
 
         This maintains keyword (BM25 sparse) search active while exposing raw field-level
         similarity scores for detail_filter_score verification.
@@ -1008,14 +1013,14 @@ class PrioritizedSearchService:
         Hybrid path (dense + BM25 sparse): the dense component is always the weighted
         multi-field cosine sum; the dense+sparse fusion is selected by
         settings.HYBRID_FUSION_METHOD:
-          - "weighted" (default): each modality is min-max normalized to [0, 1] across
+          - "weighted": each modality is min-max normalized to [0, 1] across
             the candidate pool, then fused:
                 Final_Score = HYBRID_DENSE_WEIGHT × dense_norm + HYBRID_SPARSE_WEIGHT × sparse_norm
           - "rrf": Reciprocal Rank Fusion over two lists — the combined dense list
             (ranked by the weighted cosine sum) and the sparse list:
                 Final_Score = minmax( 1/(RRF_K+dense_rank) + 1/(RRF_K+sparse_rank) )
         Both modes keep the final score on a calibrated 0-1 scale comparable to
-        filter_score, instead of the raw RRF fused value (~0-0.1) which never clears a
+        filter_score, instead of the raw RRF fused value, which sits far below any
         cosine-scale threshold.
 
         Two easy mistakes:
@@ -1044,7 +1049,8 @@ class PrioritizedSearchService:
         sparse_name = settings.SPARSE_VECTOR_NAME
         # Keys off whether the BM25 branch was ISSUED, not whether it matched: a zero-hit
         # sparse branch would otherwise flip scoring from the normalized [0, 1] fusion to
-        # the raw cosine sum (~0.3 max), and no single filter_score spans both. Zero hits
+        # the raw cosine sum, which occupies a much lower range — no single filter_score
+        # spans both. Zero hits
         # are handled by weight redistribution in the `weighted` branch instead.
         # sparse_has_hits is a floor, not a replacement: hits imply hybrid without the flag.
         sparse_has_hits = any(sparse_name in fs for fs in field_scores.values())
@@ -1095,21 +1101,22 @@ class PrioritizedSearchService:
                     if point_id in sparse_rank:
                         fused += 1.0 / (rrf_k + sparse_rank[point_id])
                     rrf_raw[point_id] = fused
-                # Normalize to [0, 1] so filter_score keeps a comparable scale
-                # (raw RRF values are ~0-0.03 and would never clear a threshold).
+                # Normalize to [0, 1] so filter_score keeps a comparable scale (raw RRF
+                # values sit on a 1/RRF_K scale and would never clear a threshold).
                 # rrf_raw is retained for debug surfacing (pre-normalization).
                 hybrid_scores = self._min_max_normalize(rrf_raw)
             else:
-                # Weighted min-max score fusion (default).
+                # Weighted min-max score fusion.
                 norm_dense = self._min_max_normalize(raw_dense)
                 norm_sparse = self._min_max_normalize(raw_sparse)
                 if sparse_has_hits:
                     dense_w = settings.HYBRID_DENSE_WEIGHT
                     sparse_w = settings.HYBRID_SPARSE_WEIGHT
                 else:
-                    # Sparse ran but matched nothing, so norm_sparse is all 0. Keeping 0.7
-                    # would shrink every score by 0.3 for a silent modality and push good
-                    # results under filter_score; dense takes the full share instead.
+                    # Sparse ran but matched nothing, so norm_sparse is all 0. Keeping the
+                    # configured split would shrink every score by the sparse share for a
+                    # silent modality, pushing good results under filter_score; dense takes
+                    # the full weight instead.
                     dense_w, sparse_w = 1.0, 0.0
                     logger.info(
                         "No sparse hits in candidate pool; dense weight raised to 1.0 "
