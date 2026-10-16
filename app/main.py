@@ -1,12 +1,18 @@
 import uvicorn
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from contextlib import asynccontextmanager
-from app.api.v1.api import api_router
-from app.core.clients.qdrant import ensure_collections_exist
-from app.core.clients.embedding import EmbeddingError
-from app.utils.json_handler import CustomJSONResponse
-from app.config import settings
-import logging
+from app.core.request_logging import RequestLoggingMiddleware, capture_request_body, setup_logging
+
+# Set up logging before the other app modules load, so anything they log while
+# loading already goes to app.log with the request-ID format
+setup_logging()
+
+from app.api.v1.api import api_router  # noqa: E402
+from app.core.clients.qdrant import ensure_collections_exist  # noqa: E402
+from app.core.clients.embedding import EmbeddingError  # noqa: E402
+from app.utils.json_handler import CustomJSONResponse  # noqa: E402
+from app.config import settings  # noqa: E402
+import logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +44,14 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
     root_path=root_path_config,
-    default_response_class=CustomJSONResponse
+    default_response_class=CustomJSONResponse,
+    # App-wide, so every route (including ones added later) gets its body logged;
+    # it must be set here, before include_router, for the routes to pick it up
+    dependencies=[Depends(capture_request_body)]
 )
+
+# One log line per request (request ID, status, duration, body, error) for every endpoint
+app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(api_router, prefix="/api")
 

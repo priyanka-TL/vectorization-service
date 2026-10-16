@@ -354,7 +354,6 @@ async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSe
     
     Note: Search configuration (priority order and weights) is set in app/config.py
     """
-    logger.info(f"[/documents/search] request body: {request.model_dump_json()}")
     return prioritized_search_service.search(request)
 
 

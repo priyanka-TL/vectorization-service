@@ -158,6 +158,10 @@ class Settings(BaseSettings):
     # Environment configuration
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "local")  # local, production, staging, etc.
 
+    # Request logging: add the request body to each request's log line (form fields cut to
+    # 50 chars, JSON in full, files never). Set false to log only method, path, status and errors.
+    LOG_REQUEST_BODY: bool = True
+
     @model_validator(mode='after')
     def _validate_fusion_config(self) -> 'Settings':
         valid_methods = {"weighted", "rrf"}
